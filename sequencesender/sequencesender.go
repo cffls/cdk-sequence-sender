@@ -50,6 +50,8 @@ type SequenceSender struct {
 	latestStreamBatch   uint64                     // Latest batch received by the streaming
 	seqSendingStopped   bool                       // If there is a critical error
 	streamClient        *datastreamer.StreamClient
+
+	da dataAbilitier
 }
 
 type sequenceData struct {
@@ -78,7 +80,7 @@ type ethTxAdditionalData struct {
 }
 
 // New inits sequence sender
-func New(cfg Config, etherman ethermaner) (*SequenceSender, error) {
+func New(cfg Config, etherman ethermaner, da dataAbilitier) (*SequenceSender, error) {
 	// Create sequencesender
 	s := SequenceSender{
 		cfg:               cfg,
@@ -89,6 +91,7 @@ func New(cfg Config, etherman ethermaner) (*SequenceSender, error) {
 		validStream:       false,
 		latestStreamBatch: 0,
 		seqSendingStopped: false,
+		da:                da,
 	}
 
 	// Restore pending sent sequences
@@ -456,8 +459,15 @@ func (s *SequenceSender) tryToSendSequence(ctx context.Context) {
 	log.Infof("[SeqSender] sending sequences to L1. From batch %d to batch %d", firstSequence.BatchNumber, lastSequence.BatchNumber)
 	printSequences(sequences)
 
+	// Post sequences to DA backend
+	dataAvailabilityMessage, err := s.da.PostSequence(ctx, sequences)
+	if err != nil {
+		log.Error("error posting sequences to the data availability protocol: ", err)
+		return
+	}
+
 	// Build sequence data
-	to, data, err := s.etherman.BuildSequenceBatchesTxData(s.cfg.SenderAddress, sequences, uint64(lastSequence.LastL2BLockTimestamp), firstSequence.BatchNumber-1, s.cfg.L2Coinbase)
+	to, data, err := s.etherman.BuildSequenceBatchesTxData(s.cfg.SenderAddress, sequences, uint64(lastSequence.LastL2BLockTimestamp), firstSequence.BatchNumber-1, s.cfg.L2Coinbase, dataAvailabilityMessage)
 	if err != nil {
 		log.Errorf("[SeqSender] error estimating new sequenceBatches to add to ethtxmanager: ", err)
 		return
@@ -573,28 +583,6 @@ func (s *SequenceSender) getSequencesToSend(ctx context.Context) ([]types.Sequen
 		// Add new sequence
 		batch := *s.sequenceData[batchNumber].batch
 		sequences = append(sequences, batch)
-		firstSequence := sequences[0]
-		lastSequence := sequences[len(sequences)-1]
-
-		// Check if can be send
-		tx, err := s.etherman.EstimateGasSequenceBatches(s.cfg.SenderAddress, sequences, uint64(lastSequence.LastL2BLockTimestamp), firstSequence.BatchNumber-1, s.cfg.L2Coinbase)
-
-		if err == nil && tx.Size() > s.cfg.MaxTxSizeForL1 {
-			log.Infof("[SeqSender] oversized Data on TX oldHash %s (txSize %d > %d)", tx.Hash(), tx.Size(), s.cfg.MaxTxSizeForL1)
-			err = ErrOversizedData
-		}
-
-		if err != nil {
-			log.Infof("[SeqSender] handling estimate gas send sequence error: %v", err)
-			sequences, err = s.handleEstimateGasSendSequenceErr(ctx, sequences, batchNumber, err)
-			if sequences != nil {
-				// Handling the error gracefully, re-processing the sequence as a sanity check
-				lastSequence = sequences[len(sequences)-1]
-				_, err = s.etherman.EstimateGasSequenceBatches(s.cfg.SenderAddress, sequences, uint64(lastSequence.LastL2BLockTimestamp), firstSequence.BatchNumber-1, s.cfg.L2Coinbase)
-				return sequences, err
-			}
-			return sequences, err
-		}
 
 		// Check if the current batch is the last before a change to a new forkid, in this case we need to close and send the sequence to L1
 		if (s.cfg.ForkUpgradeBatchNumber != 0) && (batchNumber == (s.cfg.ForkUpgradeBatchNumber)) {

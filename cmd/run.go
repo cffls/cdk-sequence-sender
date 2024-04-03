@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"os"
 	"os/signal"
 	"runtime"
 
+	dataCommitteeClient "github.com/0xPolygon/cdk-data-availability/client"
 	ethtxman "github.com/0xPolygonHermez/zkevm-ethtx-manager/etherman"
 	"github.com/0xPolygonHermez/zkevm-ethtx-manager/etherman/etherscan"
 	"github.com/0xPolygonHermez/zkevm-sequence-sender"
 	"github.com/0xPolygonHermez/zkevm-sequence-sender/config"
+	"github.com/0xPolygonHermez/zkevm-sequence-sender/dataavailability"
+	"github.com/0xPolygonHermez/zkevm-sequence-sender/dataavailability/datacommittee"
 	"github.com/0xPolygonHermez/zkevm-sequence-sender/etherman"
 	"github.com/0xPolygonHermez/zkevm-sequence-sender/log"
 	"github.com/0xPolygonHermez/zkevm-sequence-sender/sequencesender"
@@ -71,7 +75,12 @@ func createSequenceSender(cfg config.Config) *sequencesender.SequenceSender {
 	}
 	cfg.SequenceSender.SenderAddress = auth.From
 
-	seqSender, err := sequencesender.New(cfg.SequenceSender, etherman)
+	da, err := newDataAvailability(cfg, etherman)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	seqSender, err := sequencesender.New(cfg.SequenceSender, etherman, da)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -106,4 +115,43 @@ func logVersion() {
 		"built", zkevm.BuildDate,
 		"os/arch", fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
 	)
+}
+
+func newDataAvailability(c config.Config, etherman *etherman.Client) (*dataavailability.DataAvailability, error) {
+
+	// Backend specific config
+	daProtocolName, err := etherman.GetDAProtocolName()
+	if err != nil {
+		return nil, fmt.Errorf("error getting data availability protocol name: %v", err)
+	}
+	var daBackend dataavailability.DABackender
+	switch daProtocolName {
+	case string(dataavailability.DataAvailabilityCommittee):
+		var (
+			pk  *ecdsa.PrivateKey
+			err error
+		)
+		_, pk, err = etherman.LoadAuthFromKeyStore(c.SequenceSender.PrivateKey.Path, c.SequenceSender.PrivateKey.Password)
+		if err != nil {
+			return nil, err
+		}
+		dacAddr, err := etherman.GetDAProtocolAddr()
+		if err != nil {
+			return nil, fmt.Errorf("error getting trusted sequencer URI. Error: %v", err)
+		}
+
+		daBackend, err = datacommittee.New(
+			c.SequenceSender.EthTxManager.Etherman.URL,
+			dacAddr,
+			pk,
+			dataCommitteeClient.NewFactory(),
+		)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unexpected / unsupported DA protocol: %s", daProtocolName)
+	}
+
+	return dataavailability.New(daBackend)
 }
