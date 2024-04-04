@@ -583,6 +583,14 @@ func (s *SequenceSender) getSequencesToSend(ctx context.Context) ([]types.Sequen
 		// Add new sequence
 		batch := *s.sequenceData[batchNumber].batch
 		sequences = append(sequences, batch)
+		// Check if can be send
+		if len(sequences) == int(s.cfg.MaxBatchesForL1) {
+			log.Info(
+				"sequence should be sent to L1, because MaxBatchesForL1 (%d) has been reached",
+				s.cfg.MaxBatchesForL1,
+			)
+			return sequences, nil
+		}
 
 		// Check if the current batch is the last before a change to a new forkid, in this case we need to close and send the sequence to L1
 		if (s.cfg.ForkUpgradeBatchNumber != 0) && (batchNumber == (s.cfg.ForkUpgradeBatchNumber)) {
