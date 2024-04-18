@@ -7,7 +7,7 @@ require (
 	github.com/0xPolygonHermez/zkevm-data-streamer v0.2.0
 	github.com/0xPolygonHermez/zkevm-ethtx-manager v0.0.11
 	github.com/0xPolygonHermez/zkevm-node v0.5.0
-	github.com/ethereum/go-ethereum v1.13.14
+	github.com/ethereum/go-ethereum v1.13.15
 	github.com/hermeznetwork/tracerr v0.3.2
 	github.com/invopop/jsonschema v0.12.0
 	github.com/mitchellh/mapstructure v1.5.0
