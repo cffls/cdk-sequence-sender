@@ -118,7 +118,6 @@ func logVersion() {
 }
 
 func newDataAvailability(c config.Config, etherman *etherman.Client) (*dataavailability.DataAvailability, error) {
-
 	// Backend specific config
 	daProtocolName, err := etherman.GetDAProtocolName()
 	if err != nil {

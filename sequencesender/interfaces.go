@@ -13,6 +13,6 @@ type ethermaner interface {
 	GetLatestBatchNumber() (uint64, error)
 }
 
-type dataAbilitier interface {
+type dataAvailabilityLayer interface {
 	PostSequence(ctx context.Context, sequences []ethmanTypes.Sequence) ([]byte, error)
 }
