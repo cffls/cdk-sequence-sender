@@ -584,7 +584,7 @@ func (s *SequenceSender) getSequencesToSend() ([]types.Sequence, error) {
 		sequences = append(sequences, batch)
 		// Check if can be send
 		if len(sequences) == int(s.cfg.MaxBatchesForL1) {
-			log.Info(
+			log.Infof(
 				"sequence should be sent to L1, because MaxBatchesForL1 (%d) has been reached",
 				s.cfg.MaxBatchesForL1,
 			)
