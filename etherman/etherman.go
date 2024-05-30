@@ -2,11 +2,13 @@ package etherman
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
 
+	"github.com/0xPolygonHermez/zkevm-sequence-sender/etherman/smartcontracts/dataavailabilityprotocol"
 	"github.com/0xPolygonHermez/zkevm-sequence-sender/etherman/smartcontracts/polygonrollupmanager"
 	"github.com/0xPolygonHermez/zkevm-sequence-sender/etherman/smartcontracts/polygonzkevm"
 	ethmanTypes "github.com/0xPolygonHermez/zkevm-sequence-sender/etherman/types"
@@ -16,6 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
@@ -52,6 +55,7 @@ type Client struct {
 	EthClient     ethereumClient
 	ZkEVM         *polygonzkevm.Polygonzkevm
 	RollupManager *polygonrollupmanager.Polygonrollupmanager
+	DAProtocol    *dataavailabilityprotocol.Dataavailabilityprotocol
 
 	RollupID uint32
 
@@ -85,10 +89,20 @@ func NewClient(cfg Config, l1Config L1Config) (*Client, error) {
 	}
 	log.Debug("rollupID: ", rollupID)
 
+	dapAddr, err := zkevm.DataAvailabilityProtocol(&bind.CallOpts{Pending: false})
+	if err != nil {
+		return nil, err
+	}
+	dap, err := dataavailabilityprotocol.NewDataavailabilityprotocol(dapAddr, ethClient)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Client{
 		EthClient:     ethClient,
 		ZkEVM:         zkevm,
 		RollupManager: rollupManager,
+		DAProtocol:    dap,
 		RollupID:      rollupID,
 		l1Cfg:         l1Config,
 		cfg:           cfg,
@@ -97,7 +111,7 @@ func NewClient(cfg Config, l1Config L1Config) (*Client, error) {
 }
 
 // EstimateGasSequenceBatches estimates gas for sending batches
-func (etherMan *Client) EstimateGasSequenceBatches(sender common.Address, sequences []ethmanTypes.Sequence, maxSequenceTimestamp uint64, initSequenceBatchNumber uint64, l2Coinbase common.Address) (*types.Transaction, error) {
+func (etherMan *Client) EstimateGasSequenceBatches(sender common.Address, sequences []ethmanTypes.Sequence, maxSequenceTimestamp uint64, initSequenceBatchNumber uint64, l2Coinbase common.Address, dataAvailabilityMessage []byte) (*types.Transaction, error) {
 	opts, err := etherMan.getAuthByAddress(sender)
 	if err == ErrNotFound {
 		return nil, ErrPrivateKeyNotFound
@@ -105,7 +119,7 @@ func (etherMan *Client) EstimateGasSequenceBatches(sender common.Address, sequen
 	opts.NoSend = true
 
 	// Cost using calldata
-	tx, err := etherMan.sequenceBatches(opts, sequences, maxSequenceTimestamp, initSequenceBatchNumber, l2Coinbase)
+	tx, err := etherMan.sequenceBatches(opts, sequences, maxSequenceTimestamp, initSequenceBatchNumber, l2Coinbase, dataAvailabilityMessage)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +127,7 @@ func (etherMan *Client) EstimateGasSequenceBatches(sender common.Address, sequen
 }
 
 // BuildSequenceBatchesTxData builds a []bytes to be sent to the PoE SC method SequenceBatches.
-func (etherMan *Client) BuildSequenceBatchesTxData(sender common.Address, sequences []ethmanTypes.Sequence, maxSequenceTimestamp uint64, lastSequencedBatchNumber uint64, l2Coinbase common.Address) (to *common.Address, data []byte, err error) {
+func (etherMan *Client) BuildSequenceBatchesTxData(sender common.Address, sequences []ethmanTypes.Sequence, maxSequenceTimestamp uint64, lastSequencedBatchNumber uint64, l2Coinbase common.Address, dataAvailabilityMessage []byte) (to *common.Address, data []byte, err error) {
 	opts, err := etherMan.getAuthByAddress(sender)
 	if err == ErrNotFound {
 		return nil, nil, fmt.Errorf("failed to build sequence batches, err: %w", ErrPrivateKeyNotFound)
@@ -125,7 +139,7 @@ func (etherMan *Client) BuildSequenceBatchesTxData(sender common.Address, sequen
 	opts.GasPrice = big.NewInt(1)
 
 	var tx *types.Transaction
-	tx, err = etherMan.sequenceBatches(opts, sequences, maxSequenceTimestamp, lastSequencedBatchNumber, l2Coinbase)
+	tx, err = etherMan.sequenceBatches(opts, sequences, maxSequenceTimestamp, lastSequencedBatchNumber, l2Coinbase, dataAvailabilityMessage)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -148,15 +162,15 @@ func (etherMan *Client) CurrentNonce(ctx context.Context, account common.Address
 }
 
 // LoadAuthFromKeyStore loads an authorization from a key store file
-func (etherMan *Client) LoadAuthFromKeyStore(path, password string) (*bind.TransactOpts, error) {
-	auth, err := newAuthFromKeystore(path, password, etherMan.l1Cfg.L1ChainID)
+func (etherMan *Client) LoadAuthFromKeyStore(path, password string) (*bind.TransactOpts, *ecdsa.PrivateKey, error) {
+	auth, pk, err := newAuthFromKeystore(path, password, etherMan.l1Cfg.L1ChainID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	log.Infof("loaded authorization for address: %v", auth.From.String())
 	etherMan.auth[auth.From] = auth
-	return &auth, nil
+	return &auth, pk, nil
 }
 
 // getAuthByAddress tries to get an authorization from the authorizations map
@@ -168,15 +182,15 @@ func (etherMan *Client) getAuthByAddress(addr common.Address) (bind.TransactOpts
 	return auth, nil
 }
 
-func (etherMan *Client) sequenceBatches(opts bind.TransactOpts, sequences []ethmanTypes.Sequence, maxSequenceTimestamp uint64, lastSequencedBatchNumber uint64, l2Coinbase common.Address) (*types.Transaction, error) {
-	var batches []polygonzkevm.PolygonRollupBaseEtrogBatchData
+func (etherMan *Client) sequenceBatches(opts bind.TransactOpts, sequences []ethmanTypes.Sequence, maxSequenceTimestamp uint64, lastSequencedBatchNumber uint64, l2Coinbase common.Address, dataAvailabilityMessage []byte) (*types.Transaction, error) {
+	var batches []polygonzkevm.PolygonValidiumEtrogValidiumBatchData
 	for _, seq := range sequences {
 		var ger common.Hash
 		if seq.ForcedBatchTimestamp > 0 {
 			ger = seq.GlobalExitRoot
 		}
-		batch := polygonzkevm.PolygonRollupBaseEtrogBatchData{
-			Transactions:         seq.BatchL2Data,
+		batch := polygonzkevm.PolygonValidiumEtrogValidiumBatchData{
+			TransactionsHash:     crypto.Keccak256Hash(seq.BatchL2Data),
 			ForcedGlobalExitRoot: ger,
 			ForcedTimestamp:      uint64(seq.ForcedBatchTimestamp),
 			ForcedBlockHashL1:    seq.PrevBlockHash,
@@ -185,7 +199,7 @@ func (etherMan *Client) sequenceBatches(opts bind.TransactOpts, sequences []ethm
 		batches = append(batches, batch)
 	}
 
-	tx, err := etherMan.ZkEVM.SequenceBatches(&opts, batches, maxSequenceTimestamp, lastSequencedBatchNumber, l2Coinbase)
+	tx, err := etherMan.ZkEVM.SequenceBatchesValidium(&opts, batches, maxSequenceTimestamp, lastSequencedBatchNumber, l2Coinbase, dataAvailabilityMessage)
 	if err != nil {
 		log.Debugf("Batches to send: %+v", batches)
 		log.Debug("l2CoinBase: ", l2Coinbase)
@@ -232,20 +246,20 @@ func (etherMan *Client) AddOrReplaceAuth(auth bind.TransactOpts) error {
 }
 
 // newAuthFromKeystore an authorization instance from a keystore file
-func newAuthFromKeystore(path, password string, chainID uint64) (bind.TransactOpts, error) {
+func newAuthFromKeystore(path, password string, chainID uint64) (bind.TransactOpts, *ecdsa.PrivateKey, error) {
 	log.Infof("reading key from: %v", path)
 	key, err := newKeyFromKeystore(path, password)
 	if err != nil {
-		return bind.TransactOpts{}, err
+		return bind.TransactOpts{}, nil, err
 	}
 	if key == nil {
-		return bind.TransactOpts{}, nil
+		return bind.TransactOpts{}, nil, nil
 	}
 	auth, err := bind.NewKeyedTransactorWithChainID(key.PrivateKey, new(big.Int).SetUint64(chainID))
 	if err != nil {
-		return bind.TransactOpts{}, err
+		return bind.TransactOpts{}, nil, err
 	}
-	return *auth, nil
+	return *auth, key.PrivateKey, nil
 }
 
 // newKeyFromKeystore creates an instance of a keystore key from a keystore file
@@ -263,4 +277,14 @@ func newKeyFromKeystore(path, password string) (*keystore.Key, error) {
 		return nil, err
 	}
 	return key, nil
+}
+
+// GetDAProtocolAddr returns the address of the data availability protocol
+func (etherMan *Client) GetDAProtocolAddr() (common.Address, error) {
+	return etherMan.ZkEVM.DataAvailabilityProtocol(&bind.CallOpts{Pending: false})
+}
+
+// GetDAProtocolName returns the name of the data availability protocol
+func (etherMan *Client) GetDAProtocolName() (string, error) {
+	return etherMan.DAProtocol.GetProcotolName(&bind.CallOpts{Pending: false})
 }
